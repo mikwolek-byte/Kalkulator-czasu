@@ -19,15 +19,28 @@ KEYWORDS = {
 def clean_numeric(val):
     """
     Czyści i formatuje wartości liczbowe z Excela.
-    Zamienia przecinki na kropki, usuwa białe znaki i konwertuje do float.
+    Obsługuje spacje jako separatory tysięcy, przecinki itp.
     """
-    if pd.isna(val):
+    if pd.isna(val) or val == '':
         return 0.0
     if isinstance(val, (int, float)):
         return float(val)
-    val = str(val).strip().replace(',', '.')
-    # Ekstrakcja samej liczby, jeśli są jakieś znaki (np. "12 kg")
-    match = re.search(r'[-+]?\d*\.\d+|\d+', val)
+    
+    # Zamiana na tekst i usunięcie białych znaków (np. spacji jako separatora tysięcy: "1 234,56")
+    val_str = str(val).strip().replace(' ', '').replace('\xa0', '')
+    
+    # Inteligentna obsługa separatorów tysięcy i miejsc dziesiętnych
+    if '.' in val_str and ',' in val_str:
+        if val_str.rfind(',') > val_str.rfind('.'): # ',' to separator dziesiętny (np. 1.234,56)
+            val_str = val_str.replace('.', '').replace(',', '.')
+        else: # '.' to separator dziesiętny (np. 1,234.56)
+            val_str = val_str.replace(',', '')
+    else:
+        # Tylko jeden separator - zamieniamy przecinek na kropkę
+        val_str = val_str.replace(',', '.')
+
+    # Ekstrakcja samej liczby, ignorowanie tekstu (np. "12 kg")
+    match = re.search(r'[-+]?\d*\.\d+|\d+', val_str)
     return float(match.group()) if match else 0.0
 
 def categorize_element(row, name_col, profile_col):
@@ -158,8 +171,20 @@ def main():
 
     if uploaded_file is not None:
         try:
-            # Wczytywanie bez ustalania konkretnych indeksów - płaska tabela
-            df = pd.read_excel(uploaded_file)
+            st.write("---")
+            # Dodanie opcji wyboru wiersza nagłówka (omijanie metadanych na górze Excela)
+            header_row = st.number_input(
+                "W którym wierszu znajduje się nagłówek tabeli? (0 = pierwszy wiersz)", 
+                min_value=0, max_value=50, value=0, step=1,
+                help="Jeśli na górze pliku są loga, nazwa projektu lub data, zwiększ tę wartość, aż nagłówki w sekcji 'Mapowanie Kolumn' wczytają się poprawnie."
+            )
+            
+            # Wczytywanie z uwzględnieniem wybranego wiersza nagłówka
+            df = pd.read_excel(uploaded_file, header=header_row)
+            
+            # Zamiana wszystkich nazw kolumn na stringi (ochrona przed kolumnami typu float/int)
+            df.columns = df.columns.astype(str)
+            
             st.success(f"Pomyślnie wczytano plik. Liczba wierszy: {len(df)}")
             
             # Usunięcie całkowicie pustych wierszy i kolumn
@@ -227,13 +252,17 @@ def main():
                         st.download_button(
                             label="📥 Pobierz Przetworzony Raport (Excel)",
                             data=buffer,
-                            file_name="BOM_Kalkulacja_Rg.xlsx",
+                            file_name=f"BOM_Kalkulacja_Rg_{uploaded_file.name}",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             type="primary"
                         )
                         
         except Exception as e:
-            st.error(f"Wystąpił błąd podczas analizy pliku. Upewnij się, że przypisane kolumny mają poprawny format. Szczegóły błędu: {e}")
+            st.error("❌ Wystąpił błąd podczas analizy pliku. Upewnij się, że:")
+            st.markdown("- Wybrano poprawny wiersz nagłówka (powyżej).")
+            st.markdown("- Plik nie jest zablokowany hasłem.")
+            st.error(f"Szczegóły techniczne błędu: {e}")
+            st.exception(e) # Wyświetli pełny traceback, co pomoże w diagnozie, jeśli problem będzie nietypowy.
 
 # Punkt wejścia aplikacji
 if __name__ == "__main__":
