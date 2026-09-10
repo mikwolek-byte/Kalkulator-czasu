@@ -1,237 +1,240 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import io
 import re
-from pydantic import BaseModel, Field
 
-# ==========================================
-# 1. STAŁE TECHNOLOGICZNE (PANEL ADMINA)
-# ==========================================
-CONF_PREP_PROFIL = 5.0
-CONF_PREP_BLACHA = 50.0
-CONF_FIT_PROFIL = 20.0
-CONF_FIT_BLACHA = 7.0
-CONF_MULTIPLIER = 2.0
-CONF_WELD_MIN_MB = 20.0
-CONF_LOG_INTERNAL = 30.0
-CONF_LOG_LOADING = 10.0
+st.set_page_config(page_title="Analizator BOM - Konstrukcje Stalowe", layout="wide", page_icon="🏗️")
 
-# ==========================================
-# 2. WALIDACJA DANYCH (PYDANTIC)
-# ==========================================
-class ProductionData(BaseModel):
-    total_w_profil: float = Field(default=0.0, ge=0.0)
-    total_w_blacha: float = Field(default=0.0, ge=0.0)
-    qty_profil_pcs: int = Field(default=0, ge=0)
-    qty_blacha_pcs: int = Field(default=0, ge=0)
-    total_weld_mb: float = Field(default=0.0, ge=0.0)
-    total_ass_pcs: int = Field(default=0, ge=0)
+# Definicja słowników słów kluczowych do automatycznego mapowania kolumn (PL, EN, DE)
+KEYWORDS = {
+    'assembly': ['pozycja', 'assembly', 'mark', 'baugruppe', 'nr', 'numer', 'pos', 'podzespół'],
+    'name': ['nazwa', 'name', 'teil', 'opis', 'description', 'bezeichnung', 'element', 'part'],
+    'profile': ['profil', 'type', 'typ', 'querschnitt', 'kształtownik', 'przekrój', 'wymiar'],
+    'qty': ['szt', 'ilość', 'qty', 'quantity', 'menge', 'stk', 'anzahl', 'sztuka', 'sztuk'],
+    'length': ['długość', 'length', 'länge', 'dlugosc', 'dl', 'dł'],
+    'mass_total': ['masa całkowita', 'waga całkowita', 'total mass', 'total weight', 'gesamtgewicht', 'ciężar całkowity', 'masa', 'waga', 'mass', 'gewicht']
+}
 
-# ==========================================
-# 3. SILNIK MATEMATYCZNY
-# ==========================================
-def calculate_production(data: ProductionData) -> dict:
-    t_prep_profil = data.total_w_profil * CONF_PREP_PROFIL
-    t_prep_blacha = data.total_w_blacha * CONF_PREP_BLACHA
-    t_prep = t_prep_profil + t_prep_blacha
-
-    minuty_montazu = (data.qty_profil_pcs * CONF_FIT_PROFIL) + (data.qty_blacha_pcs * CONF_FIT_BLACHA)
-    t_fit = (minuty_montazu * CONF_MULTIPLIER) / 60.0
-    t_weld = (data.total_weld_mb * CONF_WELD_MIN_MB) / 60.0
-    t_log = (data.total_ass_pcs * (CONF_LOG_INTERNAL + CONF_LOG_LOADING)) / 60.0
-
-    total_rbg = t_prep + t_fit + t_weld + t_log
-    total_tons = data.total_w_profil + data.total_w_blacha
-    rbg_per_ton = total_rbg / total_tons if total_tons > 0 else 0.0
-
-    return {
-        "t_prep": round(t_prep, 2),
-        "t_fit": round(t_fit, 2),
-        "t_weld": round(t_weld, 2),
-        "t_log": round(t_log, 2),
-        "total_rbg": round(total_rbg, 2),
-        "total_tons": round(total_tons, 2),
-        "rbg_per_ton": round(rbg_per_ton, 2)
-    }
-
-# ==========================================
-# 4. INTELIGENTNY PARSER EXCEL Z FUZZY MATCHING
-# ==========================================
-def extract_number(val) -> float:
-    """Ekstrahuje pierwszą liczbę z dowolnego ciągu znaków (np. '14.5 kg' -> 14.5)"""
+def clean_numeric(val):
+    """
+    Czyści i formatuje wartości liczbowe z Excela.
+    Zamienia przecinki na kropki, usuwa białe znaki i konwertuje do float.
+    """
     if pd.isna(val):
         return 0.0
-    val_str = str(val).replace(',', '.')
-    numbers = re.findall(r"[-+]?\d*\.\d+|\d+", val_str)
-    if numbers:
-        return float(numbers[0])
-    return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    val = str(val).strip().replace(',', '.')
+    # Ekstrakcja samej liczby, jeśli są jakieś znaki (np. "12 kg")
+    match = re.search(r'[-+]?\d*\.\d+|\d+', val)
+    return float(match.group()) if match else 0.0
 
-def parse_excel_bom(file):
-    try:
-        # 1. Wczytanie próbne bez nagłówków, aby odnaleźć początek tabeli
-        temp_df = pd.read_excel(file, header=None)
-        header_idx = -1
-        
-        # Skanowanie pierwszych 30 wierszy w poszukiwaniu słów kluczowych
-        for i, row in temp_df.head(30).iterrows():
-            row_str = " ".join([str(x).lower() for x in row.values if pd.notna(x)])
-            # Sprawdzamy, czy wiersz zawiera typowe nazwy kolumn
-            has_profile = any(k in row_str for k in ['profil', 'description', 'opis', 'nazwa', 'name', 'part'])
-            has_weight = any(k in row_str for k in ['waga', 'weight', 'masa', 'ciężar', 'ciezar'])
-            
-            if has_profile and has_weight:
-                header_idx = i
+def categorize_element(row, name_col, profile_col):
+    """
+    Kategoryzuje element na podstawie nazwy i profilu.
+    Główny podział: Blacha (Plate) vs Profil (Profile).
+    """
+    text_to_check = f"{str(row.get(name_col, '')).lower()} {str(row.get(profile_col, '')).lower()}"
+    plate_keywords = ['blacha', 'pl', 'blech', 'plate', 'sheet', 'flach', 'bl']
+    
+    # Sprawdzanie czy jakiekolwiek słowo kluczowe blachy występuje w tekście
+    if any(kw in text_to_check.split() or kw in text_to_check for kw in plate_keywords):
+        return 'Blacha'
+    
+    # Jeżeli nie rozpoznamy blachy, traktujemy jako Profil kształtowy
+    return 'Profil'
+
+def auto_detect_columns(df_columns):
+    """
+    Przeszukuje nagłówki Excela i proponuje mapowanie do wymaganych kolumn logiki biznesowej.
+    """
+    mapped = {k: None for k in KEYWORDS.keys()}
+    for k, keywords in KEYWORDS.items():
+        for col in df_columns:
+            # Porównanie bez uwzględniania wielkości liter i zbędnych spacji
+            col_lower = col.lower().strip()
+            if any(kw in col_lower for kw in keywords) and mapped[k] is None:
+                mapped[k] = col
                 break
-                
-        if header_idx == -1:
-            return temp_df, "Nie znaleziono wiersza z nagłówkami. Upewnij się, że tabela ma kolumny z Profilem i Wagą."
+    return mapped
 
-        # 2. Właściwe wczytanie z odpowiednim nagłówkiem
-        df = pd.read_excel(file, header=header_idx)
-        df.columns = [str(c).lower().strip() for c in df.columns]
+def process_bom_data(df, mapped_cols):
+    """
+    Wykonuje główną logikę algorytmów obliczeniowych zgodnie z podanymi regułami.
+    """
+    # 1. Tworzymy kopię i wczytujemy zabezpieczone kolumny
+    processed_df = df.copy()
+    
+    c_asm = mapped_cols['assembly']
+    c_name = mapped_cols['name']
+    c_prof = mapped_cols['profile']
+    c_qty = mapped_cols['qty']
+    c_len = mapped_cols['length']
+    c_mass = mapped_cols['mass_total']
 
-        # 3. Fuzzy matching - przypisywanie elastyczne kolumn
-        col_profile = next((c for c in df.columns if any(k in c for k in ['profile', 'profil', 'description', 'opis', 'name', 'nazwa', 'kształtownik', 'part'])), None)
-        col_qty = next((c for c in df.columns if any(k in c for k in ['qty', 'quantity', 'ilość', 'ilosc', 'szt', 'liczba', 'count'])), None)
-        col_weight = next((c for c in df.columns if any(k in c for k in ['weight', 'waga', 'ciężar', 'ciezar', 'masa', 'wgt'])), None)
-        col_length = next((c for c in df.columns if any(k in c for k in ['length', 'długość', 'dlugosc', 'dł', 'len'])), None)
-        col_assembly = next((c for c in df.columns if any(k in c for k in ['assembly', 'mark', 'zespół', 'pozycja', 'nr', 'pos', 'element'])), None)
+    # 2. Czyszczenie i konwersja danych numerycznych
+    processed_df['Qty_Clean'] = processed_df[c_qty].apply(clean_numeric)
+    processed_df['Len_Clean'] = processed_df[c_len].apply(clean_numeric)
+    processed_df['Mass_Clean'] = processed_df[c_mass].apply(clean_numeric)
 
-        if not col_profile or not col_weight:
-            return df, f"Znalazłem tabelę, ale brakuje kluczowych kolumn. Znalezione nagłówki: {', '.join(df.columns)}"
+    # 3. Rozpoznanie typu elementu
+    processed_df['Kategoria'] = processed_df.apply(lambda r: categorize_element(r, c_name, c_prof), axis=1)
 
-        # 4. Przeliczanie danych
-        calc_w_profil, calc_w_blacha = 0.0, 0.0
-        calc_qty_profil, calc_qty_blacha = 0, 0
-        calc_weld_mb = 0.0
-        unique_assemblies = set()
+    # 4. Detekcja Profilu Głównego (Największa waga i długość w zespole)
+    processed_df['Main_Profile'] = False
+    
+    # Grupowanie po numerze pozycji/podzespołu (obsługa NaN poprzez wypełnienie 'BRAK_ZESPOLU')
+    processed_df[c_asm] = processed_df[c_asm].fillna('BRAK_ZESPOLU').astype(str)
+    
+    for asm_name, group in processed_df.groupby(c_asm):
+        # Wyodrębnij tylko profile
+        profiles = group[group['Kategoria'] == 'Profil']
+        if not profiles.empty:
+            # Sortuj malejąco po masie, następnie po długości
+            sorted_profiles = profiles.sort_values(by=['Mass_Clean', 'Len_Clean'], ascending=[False, False])
+            # Indeks największego profilu zyskuje status True
+            main_idx = sorted_profiles.index[0]
+            processed_df.at[main_idx, 'Main_Profile'] = True
 
-        for _, row in df.iterrows():
-            if pd.isna(row[col_profile]) or "total" in str(row[col_profile]).lower():
-                continue
-                
-            desc = str(row[col_profile]).strip().upper()
-            
-            # Bezpieczne pobieranie liczb
-            qty = int(extract_number(row[col_qty])) if col_qty else 1
-            if qty == 0: qty = 1
-            
-            weight_kg = extract_number(row[col_weight])
-            length_mm = extract_number(row[col_length]) if col_length else 0.0
+    # Inicjalizacja kolumn z czasami [w minutach, a potem przeliczenie na R-g (Roboczogodziny)]
+    
+    # Zmienne pomocnicze
+    def calc_assembly(row):
+        qty = row['Qty_Clean']
+        if row['Kategoria'] == 'Blacha':
+            return 14.0 * qty
+        elif row['Main_Profile']:
+            return 40.0 * qty
+        else: # Pozostałe profile
+            return 24.0 * qty
 
-            if col_assembly and pd.notna(row[col_assembly]):
-                unique_assemblies.add(str(row[col_assembly]).strip())
-
-            # Logika rozdziału (Blachy i Profile)
-            is_plate = desc.startswith(("PL", "BL", "FL", "BLACHA"))
-            weight_ton = weight_kg / 1000.0
-
-            if is_plate:
-                calc_w_blacha += weight_ton
-                calc_qty_blacha += qty
-                
-                # Próba wyciągnięcia szerokości z blachy np. PL20*150 -> 150
-                w_match = re.search(r'(?:PL|BL|FL)\d+[\s\-\*xX]+(\d+(?:[\.,]\d+)?)', desc)
-                width_mm = float(w_match.group(1).replace(',', '.')) if w_match else 100.0
-                
-                # Obwód w metrach bieżących x ilość
-                perimeter_m = 2.0 * (width_mm + length_mm) / 1000.0
-                calc_weld_mb += (perimeter_m * qty)
-            else:
-                calc_w_profil += weight_ton
-                calc_qty_profil += qty
-
-        results = {
-            "w_profil": calc_w_profil,
-            "w_blacha": calc_w_blacha,
-            "qty_profil": calc_qty_profil,
-            "qty_blacha": calc_qty_blacha,
-            "weld_mb": calc_weld_mb,
-            "ass_pcs": len(unique_assemblies) if unique_assemblies else 1
-        }
-        
-        return df, results
-    except Exception as e:
-        return pd.DataFrame(), f"Krytyczny błąd podczas analizy pliku Excel: {str(e)}"
-
-# ==========================================
-# 5. INTERFEJS UŻYTKOWNIKA (STREAMLIT)
-# ==========================================
-st.set_page_config(page_title="Kalkulator Pracochłonności Zekon", layout="wide")
-
-if "form_data" not in st.session_state:
-    st.session_state.form_data = {
-        "w_profil": 0.0, "w_blacha": 0.0,
-        "qty_profil": 0, "qty_blacha": 0,
-        "weld_mb": 0.0,  "ass_pcs": 0
-    }
-    st.session_state.raw_df = pd.DataFrame()
-    st.session_state.debug_msg = ""
-
-st.title("⚙️ Kalkulator Produkcyjny - Zekon (Excel BOM)")
-st.markdown("Wersja zoptymalizowana do odczytu list materiałowych w formacie `.xlsx` / `.xls` z Tekla Structures.")
-st.markdown("---")
-
-st.sidebar.header("📂 Wczytaj plik Tekla (Excel)")
-uploaded_excel = st.sidebar.file_uploader("Przeciągnij listę materiałową", type=["xlsx", "xls"])
-
-if uploaded_excel and st.sidebar.button("Przetwórz plik Excel"):
-    with st.spinner("Inteligentne wyszukiwanie tabeli i wyliczanie obwodów blach..."):
-        df, results = parse_excel_bom(uploaded_excel)
-        st.session_state.raw_df = df
-        
-        if isinstance(results, dict):
-            st.session_state.form_data = results
-            st.session_state.debug_msg = ""
-            st.sidebar.success("Dane odczytane poprawnie!")
+    def calc_prep(row):
+        # 5 Rg/tonę dla profili, 50 Rg/tonę dla blach.
+        mass_tons = row['Mass_Clean'] / 1000.0
+        if row['Kategoria'] == 'Blacha':
+            return 50.0 * mass_tons # To zwraca od razu R-g
         else:
-            st.session_state.debug_msg = results
-            st.sidebar.error("Napotkano problem z rozpoznaniem kolumn.")
+            return 5.0 * mass_tons # To zwraca od razu R-g
 
-# Pokazywanie surowej tabeli Excel w razie błędu, by użytkownik mógł zgłosić nam nazwy kolumn
-if st.session_state.debug_msg:
-    st.error(f"⚠️ {st.session_state.debug_msg}")
-    with st.expander("👁️ Zobacz jak aplikacja widzi Twój plik (Tryb Debugowania)", expanded=True):
-        st.dataframe(st.session_state.raw_df, use_container_width=True)
-elif not st.session_state.raw_df.empty:
-    with st.expander("👁️ Podgląd wczytanych danych z pliku Excel (Sukces)"):
-        st.dataframe(st.session_state.raw_df, use_container_width=True)
+    # Aplikacja logiki
+    # Składanie [minuty] -> konwersja do R-g
+    processed_df['Składanie [min]'] = processed_df.apply(calc_assembly, axis=1)
+    processed_df['Składanie [R-g]'] = processed_df['Składanie [min]'] / 60.0
+    
+    # Spawanie (Składanie x 2) -> bezpośrednio w R-g
+    processed_df['Spawanie [R-g]'] = processed_df['Składanie [R-g]'] * 2.0
+    
+    # Przygotowanie materiału -> wzór bezpośrednio zwraca R-g
+    processed_df['Przygotowanie [R-g]'] = processed_df.apply(calc_prep, axis=1)
+    
+    # Transport wewnętrzny (30 min/szt bazując na liczbie sztuk) -> konwersja na R-g
+    processed_df['Transport [min]'] = processed_df['Qty_Clean'] * 30.0
+    processed_df['Transport [R-g]'] = processed_df['Transport [min]'] / 60.0
 
-st.markdown("### 📝 Dane zbiorcze do wyceny")
-col1, col2 = st.columns(2)
-
-fd = st.session_state.form_data
-
-with col1:
-    total_w_profil = st.number_input("Tonaż profili [T]", value=float(fd["w_profil"]), format="%.3f")
-    total_w_blacha = st.number_input("Tonaż blach [T]", value=float(fd["w_blacha"]), format="%.3f")
-    qty_profil_pcs = st.number_input("Ilość sztuk profili", value=int(fd["qty_profil"]))
-with col2:
-    qty_blacha_pcs = st.number_input("Ilość sztuk blach", value=int(fd["qty_blacha"]))
-    total_weld_mb = st.number_input("Długość spoin z obwodów blach [mb]", value=float(fd["weld_mb"]), format="%.2f")
-    total_ass_pcs = st.number_input("Liczba el. wysyłkowych (Zespołów)", value=int(fd["ass_pcs"]))
-
-if st.button("🧮 Oblicz pracochłonność", type="primary", use_container_width=True):
-    data = ProductionData(
-        total_w_profil=total_w_profil,
-        total_w_blacha=total_w_blacha,
-        qty_profil_pcs=qty_profil_pcs,
-        qty_blacha_pcs=qty_blacha_pcs,
-        total_weld_mb=total_weld_mb,
-        total_ass_pcs=total_ass_pcs
+    # Suma całkowita dla pozycji (Roboczogodziny)
+    processed_df['Suma [R-g]'] = (
+        processed_df['Składanie [R-g]'] + 
+        processed_df['Spawanie [R-g]'] + 
+        processed_df['Przygotowanie [R-g]'] + 
+        processed_df['Transport [R-g]']
     )
-    res = calculate_production(data)
-    
-    st.markdown("---")
-    st.subheader("📊 Wyniki Kalkulacji")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("CAŁKOWITY CZAS (TOTAL_RBG)", f"{res['total_rbg']} rbg")
-    m2.metric("ŁĄCZNY TONAŻ (TOTAL_TONS)", f"{res['total_tons']} T")
-    m3.metric("WSKAŹNIK OFERTOWY", f"{res['rbg_per_ton']} rbg/T")
-    
-    st.code(f"""
-1. Czas przygotowania (T_prep): {res['t_prep']} rbg
-2. Czas składania (T_fit):      {res['t_fit']} rbg
-3. Czas spawania (T_weld):      {res['t_weld']} rbg
-4. Czas logistyki (T_log):      {res['t_log']} rbg
+
+    # Zaokrąglanie wyników dla czytelności (2 miejsca po przecinku)
+    rg_cols = ['Składanie [R-g]', 'Spawanie [R-g]', 'Przygotowanie [R-g]', 'Transport [R-g]', 'Suma [R-g]']
+    processed_df[rg_cols] = processed_df[rg_cols].round(2)
+
+    return processed_df
+
+def main():
+    st.title("🏭 Analizator List Strukturalnych (BOM) Konstrukcji Stalowych")
+    st.markdown("""
+    Aplikacja przetwarza pliki Excel (BOM) i estymuje czasy roboczogodzin (R-g) dla poszczególnych procesów produkcji.
+    Obsługiwane języki kolumn: Polski, Angielski, Niemiecki. 
     """)
+
+    # 1. Wczytanie pliku
+    uploaded_file = st.file_uploader("Wgraj plik Excel (Lista materiałowa/BOM)", type=["xlsx", "xls"])
+
+    if uploaded_file is not None:
+        try:
+            # Wczytywanie bez ustalania konkretnych indeksów - płaska tabela
+            df = pd.read_excel(uploaded_file)
+            st.success(f"Pomyślnie wczytano plik. Liczba wierszy: {len(df)}")
+            
+            # Usunięcie całkowicie pustych wierszy i kolumn
+            df = df.dropna(how='all', axis=1).dropna(how='all', axis=0)
+            
+            st.subheader("1. Mapowanie Kolumn")
+            st.info("System spróbuje automatycznie dopasować kolumny z Twojego pliku Excel. Sprawdź, czy przypisania są prawidłowe, lub zmień je ręcznie.")
+            
+            columns = df.columns.tolist()
+            detected = auto_detect_columns(columns)
+            
+            # Zbuduj układ kolumn w interfejsie
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                asm_col = st.selectbox("Pozycja / Podzespół (Assembly/Mark)", ["<Brak>"] + columns, index=columns.index(detected['assembly'])+1 if detected['assembly'] else 0)
+                name_col = st.selectbox("Nazwa Elementu (Name/Description)", ["<Brak>"] + columns, index=columns.index(detected['name'])+1 if detected['name'] else 0)
+            with col2:
+                prof_col = st.selectbox("Profil / Typ (Profile/Type)", ["<Brak>"] + columns, index=columns.index(detected['profile'])+1 if detected['profile'] else 0)
+                qty_col = st.selectbox("Ilość (Quantity)", ["<Brak>"] + columns, index=columns.index(detected['qty'])+1 if detected['qty'] else 0)
+            with col3:
+                len_col = st.selectbox("Długość w mm (Length)", ["<Brak>"] + columns, index=columns.index(detected['length'])+1 if detected['length'] else 0)
+                mass_col = st.selectbox("Masa Całkowita w kg (Total Mass)", ["<Brak>"] + columns, index=columns.index(detected['mass_total'])+1 if detected['mass_total'] else 0)
+
+            # Przycisk uruchamiający analizę
+            if st.button("🚀 Uruchom Analizę", type="primary", use_container_width=True):
+                # Weryfikacja czy użytkownik wskazał najważniejsze kolumny
+                required_cols = [asm_col, name_col, prof_col, qty_col, len_col, mass_col]
+                if "<Brak>" in required_cols:
+                    st.error("Proszę przypisać wszystkie wymagane kolumny powyżej (żadna nie może mieć wartości <Brak>).")
+                else:
+                    mapped_cols = {
+                        'assembly': asm_col, 'name': name_col, 'profile': prof_col, 
+                        'qty': qty_col, 'length': len_col, 'mass_total': mass_col
+                    }
+                    
+                    with st.spinner("Przetwarzanie algorytmów i kalkulacja czasów..."):
+                        result_df = process_bom_data(df, mapped_cols)
+                        
+                        st.subheader("2. Wyniki Analizy")
+                        
+                        # Sekcja wskaźników KPI (Metrics)
+                        total_rg = result_df['Suma [R-g]'].sum()
+                        total_mass_ton = result_df['Mass_Clean'].sum() / 1000.0
+                        total_qty = result_df['Qty_Clean'].sum()
+                        
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Łączne Roboczogodziny", f"{total_rg:,.2f} R-g")
+                        m2.metric("Łączna Masa", f"{total_mass_ton:,.2f} Ton")
+                        m3.metric("Liczba Elementów", f"{total_qty:,.0f} Szt.")
+                        m4.metric("Średni czas na Tonę", f"{total_rg/total_mass_ton if total_mass_ton else 0:,.2f} R-g / T")
+
+                        # Podgląd danych (Tabela)
+                        st.dataframe(
+                            result_df, 
+                            use_container_width=True,
+                            height=400
+                        )
+
+                        # Przygotowanie przycisku do pobrania przetworzonego Excela
+                        buffer = io.BytesIO()
+                        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                            result_df.to_excel(writer, index=False, sheet_name='Analiza_R-g')
+                        buffer.seek(0)
+
+                        st.download_button(
+                            label="📥 Pobierz Przetworzony Raport (Excel)",
+                            data=buffer,
+                            file_name="BOM_Kalkulacja_Rg.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            type="primary"
+                        )
+                        
+        except Exception as e:
+            st.error(f"Wystąpił błąd podczas analizy pliku. Upewnij się, że przypisane kolumny mają poprawny format. Szczegóły błędu: {e}")
+
+# Punkt wejścia aplikacji
+if __name__ == "__main__":
+    main()
