@@ -1,4 +1,4 @@
-pydantic>=2.0.0
-streamlit>=1.30.0
-pandas>=2.0.0
-openpyxl>=3.1.0
+streamlit1.32.0
+pandas2.2.1
+openpyxl3.1.2
+numpy1.26.4
