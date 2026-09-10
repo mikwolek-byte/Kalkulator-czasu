@@ -1,4 +1,3 @@
-streamlit1.32.0
-pandas2.2.1
-openpyxl3.1.2
-numpy1.26.4
+streamlit
+pandas
+openpyxl
