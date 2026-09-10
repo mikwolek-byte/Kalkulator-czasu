@@ -16,7 +16,7 @@ CONF_LOG_INTERNAL = 30.0
 CONF_LOG_LOADING = 10.0
 
 # ==========================================
-# 2. SILNIK MATEMATYCZNY
+# 2. WALIDACJA DANYCH (PYDANTIC)
 # ==========================================
 class ProductionData(BaseModel):
     total_w_profil: float = Field(default=0.0, ge=0.0)
@@ -26,6 +26,9 @@ class ProductionData(BaseModel):
     total_weld_mb: float = Field(default=0.0, ge=0.0)
     total_ass_pcs: int = Field(default=0, ge=0)
 
+# ==========================================
+# 3. SILNIK MATEMATYCZNY
+# ==========================================
 def calculate_production(data: ProductionData) -> dict:
     t_prep_profil = data.total_w_profil * CONF_PREP_PROFIL
     t_prep_blacha = data.total_w_blacha * CONF_PREP_BLACHA
@@ -51,99 +54,108 @@ def calculate_production(data: ProductionData) -> dict:
     }
 
 # ==========================================
-# 3. INTELIGENTNY PARSER EXCEL (BOM z TEKLI)
+# 4. INTELIGENTNY PARSER EXCEL Z FUZZY MATCHING
 # ==========================================
+def extract_number(val) -> float:
+    """Ekstrahuje pierwszą liczbę z dowolnego ciągu znaków (np. '14.5 kg' -> 14.5)"""
+    if pd.isna(val):
+        return 0.0
+    val_str = str(val).replace(',', '.')
+    numbers = re.findall(r"[-+]?\d*\.\d+|\d+", val_str)
+    if numbers:
+        return float(numbers[0])
+    return 0.0
+
 def parse_excel_bom(file):
-    # Najpierw wczytujemy plik bez nagłówków, aby odnaleźć wiersz z nazwami kolumn
-    # (Tekla często dodaje kilka pustych wierszy lub tytuł projektu na samej górze)
-    temp_df = pd.read_excel(file, header=None)
-    header_idx = 0
-    
-    for i, row in temp_df.iterrows():
-        row_str = " ".join([str(x).lower() for x in row.values if pd.notna(x)])
-        # Szukamy kluczowych słów sugerujących nagłówki tabeli materiałowej
-        if any(keyword in row_str for keyword in ['profile', 'profil', 'description', 'waga', 'weight']):
-            header_idx = i
-            break
-            
-    # Właściwe wczytanie tabeli
-    df = pd.read_excel(file, header=header_idx)
-    
-    # Standaryzacja nazw kolumn do małych liter dla łatwiejszego wyszukiwania
-    df.columns = [str(c).lower().strip() for c in df.columns]
-    
-    # Próba znalezienia odpowiednich kolumn na podstawie słowników synonimów
-    col_profile = next((c for c in df.columns if any(k in c for k in ['profile', 'profil', 'description', 'opis'])), None)
-    col_qty = next((c for c in df.columns if any(k in c for k in ['qty', 'quantity', 'ilość', 'ilosc', 'szt'])), None)
-    col_weight = next((c for c in df.columns if any(k in c for k in ['weight', 'waga', 'ciężar', 'ciezar', 'masa'])), None)
-    col_length = next((c for c in df.columns if any(k in c for k in ['length', 'długość', 'dlugosc', 'dł'])), None)
-    col_assembly = next((c for c in df.columns if any(k in c for k in ['assembly', 'mark', 'zespół', 'pozycja', 'nr'])), None)
-
-    if not col_profile or not col_weight:
-        return None, "Nie udało się rozpoznać kluczowych kolumn (Profil/Waga) w pliku Excel."
-
-    # Inicjalizacja liczników
-    calc_w_profil, calc_w_blacha = 0.0, 0.0
-    calc_qty_profil, calc_qty_blacha = 0, 0
-    calc_weld_mb = 0.0
-    unique_assemblies = set()
-
-    for _, row in df.iterrows():
-        # Pomijanie pustych wierszy lub wierszy podsumowań
-        if pd.isna(row[col_profile]) or "total" in str(row[col_profile]).lower():
-            continue
-            
-        desc = str(row[col_profile]).strip().upper()
+    try:
+        # 1. Wczytanie próbne bez nagłówków, aby odnaleźć początek tabeli
+        temp_df = pd.read_excel(file, header=None)
+        header_idx = -1
         
-        # Ekstrakcja wartości liczbowych z zabezpieczeniem przed błędami (NaN, tekst)
-        try:
-            qty = int(row[col_qty]) if col_qty and pd.notna(row[col_qty]) else 1
-        except: qty = 1
-        
-        try:
-            weight_kg = float(row[col_weight]) if col_weight and pd.notna(row[col_weight]) else 0.0
-        except: weight_kg = 0.0
-        
-        try:
-            length_mm = float(row[col_length]) if col_length and pd.notna(row[col_length]) else 0.0
-        except: length_mm = 0.0
-
-        if col_assembly and pd.notna(row[col_assembly]):
-            unique_assemblies.add(str(row[col_assembly]))
-
-        # Logika podziału na Blachy i Profile
-        is_plate = desc.startswith("PL") or desc.startswith("BL") or desc.startswith("FL")
-        
-        weight_ton = weight_kg / 1000.0
-
-        if is_plate:
-            calc_w_blacha += weight_ton
-            calc_qty_blacha += qty
+        # Skanowanie pierwszych 30 wierszy w poszukiwaniu słów kluczowych
+        for i, row in temp_df.head(30).iterrows():
+            row_str = " ".join([str(x).lower() for x in row.values if pd.notna(x)])
+            # Sprawdzamy, czy wiersz zawiera typowe nazwy kolumn
+            has_profile = any(k in row_str for k in ['profil', 'description', 'opis', 'nazwa', 'name', 'part'])
+            has_weight = any(k in row_str for k in ['waga', 'weight', 'masa', 'ciężar', 'ciezar'])
             
-            # Ekstrakcja szerokości blachy z nazwy, np. PL20*150 -> 150
-            w_match = re.search(r'(?:PL|BL|FL)\d+[\s\-\*xX]+(\d+(?:[\.,]\d+)?)', desc)
-            width_mm = float(w_match.group(1).replace(',', '.')) if w_match else 100.0
-            
-            # Obwód w metrach bieżących
-            perimeter_m = 2.0 * (width_mm + length_mm) / 1000.0
-            calc_weld_mb += (perimeter_m * qty)
-        else:
-            calc_w_profil += weight_ton
-            calc_qty_profil += qty
+            if has_profile and has_weight:
+                header_idx = i
+                break
+                
+        if header_idx == -1:
+            return temp_df, "Nie znaleziono wiersza z nagłówkami. Upewnij się, że tabela ma kolumny z Profilem i Wagą."
 
-    results = {
-        "w_profil": calc_w_profil,
-        "w_blacha": calc_w_blacha,
-        "qty_profil": calc_qty_profil,
-        "qty_blacha": calc_qty_blacha,
-        "weld_mb": calc_weld_mb,
-        "ass_pcs": len(unique_assemblies) if unique_assemblies else 1
-    }
-    
-    return df, results
+        # 2. Właściwe wczytanie z odpowiednim nagłówkiem
+        df = pd.read_excel(file, header=header_idx)
+        df.columns = [str(c).lower().strip() for c in df.columns]
+
+        # 3. Fuzzy matching - przypisywanie elastyczne kolumn
+        col_profile = next((c for c in df.columns if any(k in c for k in ['profile', 'profil', 'description', 'opis', 'name', 'nazwa', 'kształtownik', 'part'])), None)
+        col_qty = next((c for c in df.columns if any(k in c for k in ['qty', 'quantity', 'ilość', 'ilosc', 'szt', 'liczba', 'count'])), None)
+        col_weight = next((c for c in df.columns if any(k in c for k in ['weight', 'waga', 'ciężar', 'ciezar', 'masa', 'wgt'])), None)
+        col_length = next((c for c in df.columns if any(k in c for k in ['length', 'długość', 'dlugosc', 'dł', 'len'])), None)
+        col_assembly = next((c for c in df.columns if any(k in c for k in ['assembly', 'mark', 'zespół', 'pozycja', 'nr', 'pos', 'element'])), None)
+
+        if not col_profile or not col_weight:
+            return df, f"Znalazłem tabelę, ale brakuje kluczowych kolumn. Znalezione nagłówki: {', '.join(df.columns)}"
+
+        # 4. Przeliczanie danych
+        calc_w_profil, calc_w_blacha = 0.0, 0.0
+        calc_qty_profil, calc_qty_blacha = 0, 0
+        calc_weld_mb = 0.0
+        unique_assemblies = set()
+
+        for _, row in df.iterrows():
+            if pd.isna(row[col_profile]) or "total" in str(row[col_profile]).lower():
+                continue
+                
+            desc = str(row[col_profile]).strip().upper()
+            
+            # Bezpieczne pobieranie liczb
+            qty = int(extract_number(row[col_qty])) if col_qty else 1
+            if qty == 0: qty = 1
+            
+            weight_kg = extract_number(row[col_weight])
+            length_mm = extract_number(row[col_length]) if col_length else 0.0
+
+            if col_assembly and pd.notna(row[col_assembly]):
+                unique_assemblies.add(str(row[col_assembly]).strip())
+
+            # Logika rozdziału (Blachy i Profile)
+            is_plate = desc.startswith(("PL", "BL", "FL", "BLACHA"))
+            weight_ton = weight_kg / 1000.0
+
+            if is_plate:
+                calc_w_blacha += weight_ton
+                calc_qty_blacha += qty
+                
+                # Próba wyciągnięcia szerokości z blachy np. PL20*150 -> 150
+                w_match = re.search(r'(?:PL|BL|FL)\d+[\s\-\*xX]+(\d+(?:[\.,]\d+)?)', desc)
+                width_mm = float(w_match.group(1).replace(',', '.')) if w_match else 100.0
+                
+                # Obwód w metrach bieżących x ilość
+                perimeter_m = 2.0 * (width_mm + length_mm) / 1000.0
+                calc_weld_mb += (perimeter_m * qty)
+            else:
+                calc_w_profil += weight_ton
+                calc_qty_profil += qty
+
+        results = {
+            "w_profil": calc_w_profil,
+            "w_blacha": calc_w_blacha,
+            "qty_profil": calc_qty_profil,
+            "qty_blacha": calc_qty_blacha,
+            "weld_mb": calc_weld_mb,
+            "ass_pcs": len(unique_assemblies) if unique_assemblies else 1
+        }
+        
+        return df, results
+    except Exception as e:
+        return pd.DataFrame(), f"Krytyczny błąd podczas analizy pliku Excel: {str(e)}"
 
 # ==========================================
-# 4. INTERFEJS UŻYTKOWNIKA (STREAMLIT)
+# 5. INTERFEJS UŻYTKOWNIKA (STREAMLIT)
 # ==========================================
 st.set_page_config(page_title="Kalkulator Pracochłonności Zekon", layout="wide")
 
@@ -154,6 +166,7 @@ if "form_data" not in st.session_state:
         "weld_mb": 0.0,  "ass_pcs": 0
     }
     st.session_state.raw_df = pd.DataFrame()
+    st.session_state.debug_msg = ""
 
 st.title("⚙️ Kalkulator Produkcyjny - Zekon (Excel BOM)")
 st.markdown("Wersja zoptymalizowana do odczytu list materiałowych w formacie `.xlsx` / `.xls` z Tekla Structures.")
@@ -163,18 +176,25 @@ st.sidebar.header("📂 Wczytaj plik Tekla (Excel)")
 uploaded_excel = st.sidebar.file_uploader("Przeciągnij listę materiałową", type=["xlsx", "xls"])
 
 if uploaded_excel and st.sidebar.button("Przetwórz plik Excel"):
-    with st.spinner("Analiza danych tabelarycznych i przeliczanie obwodów..."):
+    with st.spinner("Inteligentne wyszukiwanie tabeli i wyliczanie obwodów blach..."):
         df, results = parse_excel_bom(uploaded_excel)
+        st.session_state.raw_df = df
         
-        if df is not None:
-            st.session_state.raw_df = df
+        if isinstance(results, dict):
             st.session_state.form_data = results
+            st.session_state.debug_msg = ""
             st.sidebar.success("Dane odczytane poprawnie!")
         else:
-            st.sidebar.error(results) # Wyświetla komunikat o błędzie z funkcji
+            st.session_state.debug_msg = results
+            st.sidebar.error("Napotkano problem z rozpoznaniem kolumn.")
 
-if not st.session_state.raw_df.empty:
-    with st.expander("👁️ Podgląd wczytanych danych z pliku Excel (Otwórz)"):
+# Pokazywanie surowej tabeli Excel w razie błędu, by użytkownik mógł zgłosić nam nazwy kolumn
+if st.session_state.debug_msg:
+    st.error(f"⚠️ {st.session_state.debug_msg}")
+    with st.expander("👁️ Zobacz jak aplikacja widzi Twój plik (Tryb Debugowania)", expanded=True):
+        st.dataframe(st.session_state.raw_df, use_container_width=True)
+elif not st.session_state.raw_df.empty:
+    with st.expander("👁️ Podgląd wczytanych danych z pliku Excel (Sukces)"):
         st.dataframe(st.session_state.raw_df, use_container_width=True)
 
 st.markdown("### 📝 Dane zbiorcze do wyceny")
